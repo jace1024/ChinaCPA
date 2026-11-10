@@ -1,0 +1,191 @@
+name: Build macOS DMG
+
+# 在 GitHub 托管的 macOS runner 上从源码构建，产出可挂载的 ChinaCPA.dmg。
+# 两个架构都由 Go 交叉编译，与 runner 自身是 Intel 还是 Apple Silicon 无关。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: Build ChinaCPA.dmg
+    runs-on: macos-14
+    # 6 个 secrets 全部配置时才启用 Developer ID 签名与公证，否则走 ad-hoc 签名
+    env:
+      SIGNING_ENABLED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CERTIFICATE_NAME != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build darwin/arm64 + darwin/amd64
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o build/chinacpa-arm64 ./cmd/chinacpa
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o build/chinacpa-amd64 ./cmd/chinacpa
+          lipo -create build/chinacpa-arm64 build/chinacpa-amd64 -output build/chinacpa
+          lipo -info build/chinacpa
+
+      - name: Assemble ChinaCPA.app
+        run: |
+          set -euo pipefail
+          APP="build/staging/ChinaCPA.app/Contents"
+          STAGE="build/staging"
+          mkdir -p "$APP/MacOS" "$APP/Resources"
+          cp build/chinacpa "$APP/Resources/chinacpa"
+
+          cat > "$APP/Resources/config.json" <<'JSON'
+          {
+            "listen": ":8313",
+            "api_key": "sk-change-me",
+            "panel_password": "change-me",
+            "data_dir": "./data",
+            "schedule": {
+              "checkin_hours": [9, 21],
+              "checkin_enabled": true,
+              "tasks_enabled": true,
+              "quota_refresh_minutes": 10,
+              "token_refresh_hours": [3]
+            },
+            "qwen": { "daily_request_limit": 2000 },
+            "doubao": { "image_daily_limit": 50, "video_daily_limit": 10 },
+            "model_aliases": {},
+            "pricing": { "file": "", "usd_cny": 7.1 },
+            "request_log_days": 90,
+            "server": { "read_timeout_seconds": 0, "write_timeout_seconds": 0 }
+          }
+          JSON
+
+          cat > "$APP/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>ChinaCPA</string>
+            <key>CFBundleDisplayName</key><string>ChinaCPA</string>
+            <key>CFBundleIdentifier</key><string>local.chinacpa.gateway</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>1.0</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>launcher</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          cat > "$APP/MacOS/launcher" <<'LAUNCHER'
+          #!/bin/bash
+          RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+          DATA="$HOME/Library/Application Support/ChinaCPA"
+          mkdir -p "$DATA"
+          [ -f "$DATA/config.json" ] || cp "$RES/config.json" "$DATA/config.json"
+          cd "$DATA"
+          PORT="$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*":\([0-9][0-9]*\)".*/\1/p' config.json 2>/dev/null | head -n 1)"
+          [ -z "$PORT" ] && PORT="8313"
+          ( sleep 2; open "http://127.0.0.1:$PORT/" ) &
+          exec "$RES/chinacpa" -config "$DATA/config.json"
+          LAUNCHER
+
+          chmod +x "$APP/MacOS/launcher" "$APP/Resources/chinacpa"
+          ln -s /Applications "$STAGE/Applications"
+
+      - name: Ad-hoc codesign
+        run: |
+          set -euo pipefail
+          codesign --force --deep --sign - build/staging/ChinaCPA.app
+          codesign -v --verbose=2 build/staging/ChinaCPA.app
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+          hdiutil create -volname ChinaCPA -srcfolder build/staging -ov -format UDZO ChinaCPA.dmg
+          codesign --force --sign - ChinaCPA.dmg || true
+          shasum -a 256 ChinaCPA.dmg > ChinaCPA.dmg.sha256
+          ls -lh ChinaCPA.dmg ChinaCPA.dmg.sha256
+          echo "::notice::默认仅 ad-hoc 签名、未公证；配置签名 secrets 后会自动执行 Developer ID 签名与公证。"
+
+      - name: Developer ID sign + notarize (optional)
+        if: env.SIGNING_ENABLED == 'true'
+        timeout-minutes: 30
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          CERT_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/chinacpa.keychain-db"
+          KC_PASS="$(openssl rand -base64 24)"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          # 用 Developer ID 重签 .app（hardened runtime 是公证前置条件），再重建并签名 dmg
+          codesign --force --deep --options runtime --sign "$CERT_NAME" build/staging/ChinaCPA.app
+          codesign -v --verbose=2 build/staging/ChinaCPA.app
+          hdiutil create -volname ChinaCPA -srcfolder build/staging -ov -format UDZO ChinaCPA.dmg
+          codesign --force --sign "$CERT_NAME" ChinaCPA.dmg
+
+          xcrun notarytool submit ChinaCPA.dmg \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple ChinaCPA.dmg
+          xcrun stapler validate ChinaCPA.dmg
+          shasum -a 256 ChinaCPA.dmg > ChinaCPA.dmg.sha256
+          echo "::notice::Developer ID 签名与公证完成，dmg 可公开分发。"
+
+      - name: Verify DMG on real macOS
+        run: |
+          set -euo pipefail
+          hdiutil imageinfo ChinaCPA.dmg
+          ATTACH_OUT="$(hdiutil attach ChinaCPA.dmg -nobrowse)"
+          echo "$ATTACH_OUT"
+          MNT="$(printf '%s\n' "$ATTACH_OUT" | awk '/\/Volumes\// {print $3; exit}')"
+          test -n "$MNT" || { echo "::error::dmg 挂载失败"; exit 1; }
+          test -d "$MNT/ChinaCPA.app/Contents/MacOS" || { echo "::error::.app 结构缺失"; exit 1; }
+          test -L "$MNT/Applications" || { echo "::error::Applications 快捷方式缺失"; exit 1; }
+          lipo -info "$MNT/ChinaCPA.app/Contents/Resources/chinacpa"
+          hdiutil detach "$MNT"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChinaCPA-macOS-dmg-${{ github.run_number }}
+          path: |
+            ChinaCPA.dmg
+            ChinaCPA.dmg.sha256
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" ChinaCPA.dmg ChinaCPA.dmg.sha256 \
+            --title "ChinaCPA $GITHUB_REF_NAME" \
+            --notes "macOS 通用二进制（Apple Silicon + Intel），由 macos-14 runner 构建。是否完成 Developer ID 签名与公证取决于仓库是否配置了相应 secrets。"
+
+      - name: Cleanup signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/chinacpa.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12"
