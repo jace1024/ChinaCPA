@@ -14,7 +14,8 @@ permissions:
 jobs:
   dmg:
     name: Build ChinaCPA.dmg
-    runs-on: macos-14
+    # macOS 14 镜像已于 2026-11-02 从 GitHub Actions 退役；macos-15 是当前受支持的 arm64 标准 runner
+    runs-on: macos-15
     # 6 个 secrets 全部配置时才启用 Developer ID 签名与公证，否则走 ad-hoc 签名
     env:
       SIGNING_ENABLED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CERTIFICATE_NAME != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
@@ -182,7 +183,7 @@ jobs:
           set -euo pipefail
           gh release create "$GITHUB_REF_NAME" ChinaCPA.dmg ChinaCPA.dmg.sha256 \
             --title "ChinaCPA $GITHUB_REF_NAME" \
-            --notes "macOS 通用二进制（Apple Silicon + Intel），由 macos-14 runner 构建。是否完成 Developer ID 签名与公证取决于仓库是否配置了相应 secrets。"
+            --notes "macOS 通用二进制（Apple Silicon + Intel），由 GitHub 托管 macOS runner 构建。是否完成 Developer ID 签名与公证取决于仓库是否配置了相应 secrets。"
 
       - name: Cleanup signing keychain
         if: always()
